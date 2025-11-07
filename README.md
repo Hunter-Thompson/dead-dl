@@ -17,7 +17,7 @@ A command-line tool to download music from [relisten.org](https://relisten.net),
 ## Installation
 
 ```bash
-go install github.com/Hunter-Thomson/dead-dl@latest
+go build -o dead-dl
 ```
 
 ## Usage
