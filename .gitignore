@@ -1,0 +1,5 @@
+test-downloads/
+downloads/
+*.log
+logs/
+dead-dl
