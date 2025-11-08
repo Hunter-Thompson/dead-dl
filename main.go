@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/schollz/progressbar/v3"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 // Logger wraps multiple log.Logger instances for different log levels
@@ -232,6 +234,7 @@ func main() {
 	outputDir := flag.String("output", "./downloads", "Output directory for downloads")
 	format := flag.String("format", "mp3", "Preferred format: flac, mp3, or both")
 	highestRated := flag.Bool("highest-rated", false, "Download only the highest rated source per show")
+	concurrency := flag.Int("concurrency", 10, "Number of concurrent downloads")
 	flag.Parse()
 
 	// Initialize logger with time-based log file
@@ -324,7 +327,7 @@ func main() {
 			}
 
 			// Download files
-			if err := downloadArchiveFiles(identifier, showDir, *format); err != nil {
+			if err := downloadArchiveFiles(identifier, showDir, *format, *concurrency); err != nil {
 				logger.Error("Failed to download files: %v", err)
 				continue
 			}
@@ -388,7 +391,7 @@ func fetchHighestRatedSource(sources []Source) *Source {
 	return bestSource
 }
 
-func downloadArchiveFiles(identifier, outputDir, format string) error {
+func downloadArchiveFiles(identifier, outputDir, format string, concurrency int) error {
 	// Fetch metadata
 	url := fmt.Sprintf("%s/metadata/%s", ArchiveAPIBase, identifier)
 	resp, err := http.Get(url)
@@ -464,65 +467,87 @@ func downloadArchiveFiles(identifier, outputDir, format string) error {
 		return fmt.Errorf("no audio files found in requested format")
 	}
 
-	// Download each file
+	// Download each file with concurrency
 	downloadErrors := []string{}
 	successCount := 0
+	var mu sync.Mutex // Protect shared variables
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, concurrency) // Limit concurrent downloads
+
+	// Create progress container for multiple progress bars
+	progress := mpb.New(mpb.WithWaitGroup(&wg))
 
 	for _, file := range filesToDownload {
-		fileURL := fmt.Sprintf("%s/download/%s/%s", ArchiveAPIBase, identifier, file.Name)
+		wg.Add(1)
+		go func(file ArchiveFile) {
+			defer wg.Done()
 
-		// Use title for filename if available, otherwise use original name
-		fileName := file.Name
-		if file.Title != "" {
-			// Get extension from original filename
-			ext := filepath.Ext(file.Name)
-			// Sanitize title and use it as filename
-			sanitizedTitle := sanitizeFilename(file.Title)
-			fileName = sanitizedTitle + ext
-		}
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }() // Release semaphore
 
-		filePath := filepath.Join(outputDir, fileName)
+			fileURL := fmt.Sprintf("%s/download/%s/%s", ArchiveAPIBase, identifier, file.Name)
 
-		// Check if file already exists and verify size
-		if fileInfo, err := os.Stat(filePath); err == nil {
-			// File exists, check if size matches
-			localSize := fileInfo.Size()
-			remoteSize, parseErr := parseFileSize(file.Size)
-
-			if parseErr != nil {
-				// Can't parse remote size, log warning and re-download
-				logger.Printf("    - Re-downloading %s (unable to verify size: %v)\n", fileName, parseErr)
-			} else if localSize == remoteSize {
-				// Sizes match, skip download
-				logger.Printf("    - Skipping %s (already exists, size: %d bytes)\n", fileName, localSize)
-				successCount++
-				continue
-			} else {
-				// Sizes don't match, re-download
-				logger.Printf("    - Re-downloading %s (size mismatch: local=%d, remote=%d)\n", fileName, localSize, remoteSize)
+			// Use title for filename if available, otherwise use original name
+			fileName := file.Name
+			if file.Title != "" {
+				// Get extension from original filename
+				ext := filepath.Ext(file.Name)
+				// Sanitize title and use it as filename
+				sanitizedTitle := sanitizeFilename(file.Title)
+				fileName = sanitizedTitle + ext
 			}
-		}
 
-		logger.Printf("    - Downloading %s...\n", fileName)
-		if err := downloadFile(fileURL, filePath, fileName); err != nil {
-			// Handle specific HTTP error codes
-			if strings.Contains(err.Error(), "status 401") {
-				logger.Printf("    - ⚠ Skipping %s (restricted/requires authentication)\n", fileName)
-				downloadErrors = append(downloadErrors, fmt.Sprintf("%s: restricted", fileName))
-			} else if strings.Contains(err.Error(), "status 403") {
-				logger.Printf("    - ⚠ Skipping %s (forbidden/restricted)\n", fileName)
-				downloadErrors = append(downloadErrors, fmt.Sprintf("%s: forbidden", fileName))
-			} else {
-				logger.Printf("    - ✗ Failed to download %s: %v\n", fileName, err)
-				downloadErrors = append(downloadErrors, fmt.Sprintf("%s: %v", fileName, err))
+			filePath := filepath.Join(outputDir, fileName)
+
+			// Check if file already exists and verify size
+			if fileInfo, err := os.Stat(filePath); err == nil {
+				// File exists, check if size matches
+				localSize := fileInfo.Size()
+				remoteSize, parseErr := parseFileSize(file.Size)
+
+				if parseErr != nil {
+					// Can't parse remote size, log warning and re-download
+					logger.Printf("    - Re-downloading %s (unable to verify size: %v)\n", fileName, parseErr)
+				} else if localSize == remoteSize {
+					// Sizes match, skip download
+					logger.Printf("    - Skipping %s (already exists, size: %d bytes)\n", fileName, localSize)
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+					return
+				} else {
+					// Sizes don't match, re-download
+					logger.Printf("    - Re-downloading %s (size mismatch: local=%d, remote=%d)\n", fileName, localSize, remoteSize)
+				}
 			}
-			continue
-		}
 
-		logger.Printf("    - ✓ Downloaded %s\n", fileName)
-		successCount++
-		time.Sleep(100 * time.Millisecond) // Be nice to the server
+			if err := downloadFile(fileURL, filePath, fileName, progress); err != nil {
+				// Handle specific HTTP error codes
+				mu.Lock()
+				if strings.Contains(err.Error(), "status 401") {
+					logger.Printf("    - ⚠ Skipping %s (restricted/requires authentication)\n", fileName)
+					downloadErrors = append(downloadErrors, fmt.Sprintf("%s: restricted", fileName))
+				} else if strings.Contains(err.Error(), "status 403") {
+					logger.Printf("    - ⚠ Skipping %s (forbidden/restricted)\n", fileName)
+					downloadErrors = append(downloadErrors, fmt.Sprintf("%s: forbidden", fileName))
+				} else {
+					logger.Printf("    - ✗ Failed to download %s: %v\n", fileName, err)
+					downloadErrors = append(downloadErrors, fmt.Sprintf("%s: %v", fileName, err))
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			successCount++
+			mu.Unlock()
+			time.Sleep(100 * time.Millisecond) // Be nice to the server
+		}(file)
 	}
+
+	// Wait for all downloads to complete and progress bars to finish
+	progress.Wait()
 
 	// Return error only if all downloads failed
 	if successCount == 0 && len(downloadErrors) > 0 {
@@ -589,7 +614,7 @@ func sanitizeFilename(name string) string {
 	return result
 }
 
-func downloadFile(url, filepath, displayName string) error {
+func downloadFile(url, filepath, displayName string, progress *mpb.Progress) error {
 	// Create HTTP request
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -617,35 +642,52 @@ func downloadFile(url, filepath, displayName string) error {
 	// Get content length for progress bar
 	contentLength := resp.ContentLength
 
-	// Create progress bar
-	var bar *progressbar.ProgressBar
+	// Truncate display name if too long
+	maxNameLen := 40
+	truncatedName := displayName
+	if len(displayName) > maxNameLen {
+		truncatedName = displayName[:maxNameLen-3] + "..."
+	}
+
+	// Create progress bar for this download
+	var bar *mpb.Bar
 	if contentLength > 0 {
-		// Content length is known, show byte progress
-		bar = progressbar.DefaultBytes(
-			contentLength,
-			fmt.Sprintf("      %s", displayName),
+		// Content length is known, show byte progress with speed
+		bar = progress.AddBar(contentLength,
+			mpb.PrependDecorators(
+				decor.Name(truncatedName, decor.WCSyncWidth),
+			),
+			mpb.AppendDecorators(
+				decor.CountersKibiByte("% .2f / % .2f"),
+				decor.Percentage(decor.WCSyncSpace),
+				decor.Name(" | "),
+				decor.EwmaSpeed(decor.SizeB1024(0), "% .2f", 30),
+			),
 		)
 	} else {
-		// Content length unknown, show indeterminate progress
-		bar = progressbar.NewOptions(-1,
-			progressbar.OptionSetDescription(fmt.Sprintf("      %s", displayName)),
-			progressbar.OptionShowBytes(true),
-			progressbar.OptionShowCount(),
-			progressbar.OptionSetWidth(50),
+		// Content length unknown, show indeterminate progress with speed
+		bar = progress.AddBar(0,
+			mpb.BarFillerClearOnComplete(),
+			mpb.PrependDecorators(
+				decor.Name(truncatedName, decor.WCSyncWidth),
+			),
+			mpb.AppendDecorators(
+				decor.CountersKibiByte("% .2f"),
+				decor.Name(" | "),
+				decor.EwmaSpeed(decor.SizeB1024(0), "% .2f", 30),
+			),
 		)
 	}
 
-	// Create multi-writer to write to both file and progress bar
-	writer := io.MultiWriter(out, bar)
+	// Create proxy reader that updates progress bar
+	proxyReader := bar.ProxyReader(resp.Body)
+	defer proxyReader.Close()
 
-	// Copy data to file and update progress bar
-	_, err = io.Copy(writer, resp.Body)
+	// Copy data to file
+	_, err = io.Copy(out, proxyReader)
 	if err != nil {
 		return err
 	}
-
-	// Finish the progress bar
-	bar.Finish()
 
 	return nil
 }
