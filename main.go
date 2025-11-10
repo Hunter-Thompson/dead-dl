@@ -226,6 +226,7 @@ type ArchiveFile struct {
 	Format string `json:"format"`
 	Size   string `json:"size"`
 	Title  string `json:"title"`
+	Track  string `json:"track"`
 }
 
 func main() {
@@ -489,16 +490,19 @@ func downloadArchiveFiles(identifier, outputDir, format string, concurrency int)
 			fileURL := fmt.Sprintf("%s/download/%s/%s", ArchiveAPIBase, identifier, file.Name)
 
 			// Use title for filename if available, otherwise use original name
-			fileName := file.Name
+			fileName := fmt.Sprintf("%s %s", file.Track, file.Name)
+			oldFileName := file.Name // Old filename without track prefix
 			if file.Title != "" {
 				// Get extension from original filename
 				ext := filepath.Ext(file.Name)
 				// Sanitize title and use it as filename
 				sanitizedTitle := sanitizeFilename(file.Title)
-				fileName = sanitizedTitle + ext
+				oldFileName = sanitizedTitle + ext // Old filename with title but no track
+				fileName = fmt.Sprintf("%s %s", file.Track, sanitizedTitle+ext)
 			}
 
 			filePath := filepath.Join(outputDir, fileName)
+			oldFilePath := filepath.Join(outputDir, oldFileName)
 
 			// Check if file already exists and verify size
 			if fileInfo, err := os.Stat(filePath); err == nil {
@@ -519,6 +523,21 @@ func downloadArchiveFiles(identifier, outputDir, format string, concurrency int)
 				} else {
 					// Sizes don't match, re-download
 					logger.Printf("    - Re-downloading %s (size mismatch: local=%d, remote=%d)\n", fileName, localSize, remoteSize)
+				}
+			} else if oldFilePath != filePath {
+				// Check if file exists with old naming scheme (without track prefix)
+				if _, oldErr := os.Stat(oldFilePath); oldErr == nil {
+					// Old file exists, rename it to new filename
+					renameErr := os.Rename(oldFilePath, filePath)
+					if renameErr != nil {
+						logger.Printf("    - Failed to rename %s to %s: %v\n", oldFileName, fileName, renameErr)
+					} else {
+						logger.Printf("    - Renamed %s to %s\n", oldFileName, fileName)
+						mu.Lock()
+						successCount++
+						mu.Unlock()
+						return
+					}
 				}
 			}
 
